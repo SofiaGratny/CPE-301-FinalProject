@@ -1,0 +1,467 @@
+//
+//CPE 301 Final Project
+//Authors: Sofia Gratny, Emily Mccue, Kat Wayman, Sarah Orner
+//
+
+//included libraries that are allowed in accordance to the Final Project PDF
+#include <LiquidCrystal.h>
+#include <RTClib.h>
+#include <DHT.h>
+#include <Stepper.h>
+
+// there are four pins needed for the stepper motor that are in pins 10,11,12, and 13
+#define PIN1_STEP 10
+#define PIN2_STEP 11
+#define PIN3_STEP 12
+#define PIN4_STEP 13
+// define led pins
+#define RED_PIN 17
+#define YELLOW_PIN 16
+#define GREEN_PIN 15
+#define BLUE_PIN 14
+
+// keep this set to 18 as it is one of the pins avalible for interputs
+// defined on/off pin for the button
+#define IO 0
+// resets the button when an error is present
+#define RESET 1
+// defined lower and upper limits of the button pins
+#define UPPER_LIMIT 2
+#define LOWER_LIMIT 3
+// defined the pins when the stepper is on vs when it is off
+#define STEPPER_ON 4
+#define STEPPER_OFF 5
+// pin for humidity and temp
+#define DHT_PIN 7
+#define DHT_TYPE DHT11
+// temp humidity
+DHT dht(DHT_PIN, DHT_TYPE);
+
+//pin for water level
+#define WATER_LEVEL 8
+// pinfan motor
+#define FAN_MOTOR 6
+#define RDA 0x80
+#define TBE 0x20  
+
+// initialize the library and include the pin numbers for its interface
+LiquidCrystal lcd(30, 31, 32, 33, 34, 35);
+
+// the initialized clock
+RTC_DS1307 RTC;
+// pins for the stepper
+Stepper stepper(2048, PIN1_STEP, PIN2_STEP, PIN3_STEP, PIN4_STEP);
+
+volatile unsigned char *myUCSR0A = (unsigned char *)0x00C0;
+volatile unsigned char *myUCSR0B = (unsigned char *)0x00C1;
+volatile unsigned char *myUCSR0C = (unsigned char *)0x00C2;
+volatile unsigned int  *myUBRR0  = (unsigned int *) 0x00C4;
+volatile unsigned char *myUDR0   = (unsigned char *)0x00C6;
+
+// define the possible states for the state machine
+enum States {
+  IDLE,
+  DISABLED,
+  RUNNING,
+  ERROR,
+  START,
+};
+
+
+#define WATER_THRESH 320 // the threshold for that sensor
+#define TEMP_THRESH 10 // the temp threshold for that sensor
+
+// define the initial state for the state machine
+States initial = DISABLED;
+States previous = START;
+
+void setup()
+{
+  
+  // initialize the pins used for I2C communication with the RTC module
+  PORTD |= (1 << PD0) | (1 << PD1);
+  RTC.begin();
+
+  // set the time on the RTC module
+  DateTime now = DateTime(2022, 12, 9, 0, 0, 0);
+  RTC.adjust(now);
+
+  DDR_E |= (0x01 << GREEN_PIN | 0x01 << YELLOW_PIN);
+  DDR_G |= (0x01 << BLUE_PIN);
+  DDR_H |= (0x01 << RED_PIN | 0x01 << WATER_LEVEL | 0x01 << FAN_MOTOR);
+
+  // initialize the serial port on USART0:
+  U0init(9600);
+  dht.begin();
+
+  // init read stuff
+  adc_init();
+  
+  // set up the LCD's number of columns and rows:
+  lcd.begin(16, 2);
+  lcd.print("System Starting");
+  
+
+  // limit switch button setting
+  DDRA &= ~(0x01 << RESET | 0x01 << IO | 0x01 << UPPER_LIMIT | 0x01 << LOWER_LIMIT | 0x01 << STEPPER_ON | 0x01 << STEPPER_OFF);
+  
+
+  
+  // attach an interrupt to the button pin
+  includeInterrupt(DPToInterrupt(IO), changeHandleState, RISING);
+  stepper.setSpeed(200); //changed speed to 200 to ensure the stepper is moving
+}
+
+
+// loop update values
+int printOldTemp = 0;
+float temp = 0;
+float hum = 0;
+
+// possible messages for ldc display 
+bool checkFan = false;
+int ledC = -1;
+bool TempHumidityDis = false;
+bool enableStepper = false;
+bool checkLevel = false;
+
+// speed of stepper motor
+int stepSpeed = 2048;
+
+void loop()
+{
+  // read the time from the RTC module
+  DateTime now = RTC.now();
+  
+  if(TempHumidityDis){
+    // read the temperature and humidity from the DHT11 sensor
+    temp = dht.readTemperature();
+    hum = dht.readHumidity();
+  }
+
+  initial = decide(temp, hum, initial);
+
+  if(readPin(IO)){
+    changeHandleState();
+  }
+  // when state is switching exec
+  if(initial != previous){
+    
+    writeTimeStampTransition(now, previous, initial);
+    
+    // check the current state of the state machine
+    switch (initial) {
+      case DISABLED:
+        checkFan = false;
+        ledC = 3;
+        TempHumidityDis = false;
+        enableStepper = true;
+        checkLevel = false;
+
+        break;
+
+      case IDLE:
+        checkFan = false;
+        ledC = 2;
+        TempHumidityDis = true;
+        enableStepper = true;
+        checkLevel = true;
+
+        break;
+
+      case RUNNING:
+        checkFan = true;
+        ledC = 1;
+        TempHumidityDis = true;
+        enableStepper = true;
+        checkLevel = true;
+
+        break;
+
+      case ERROR:
+        lcd.clear();
+        lcd.print("Error, low water level");
+        checkFan = false;
+        ledC = 0;
+        TempHumidityDis = true;
+        enableStepper = false;
+        checkLevel = true;
+
+
+        break;
+      case START:
+        break;
+    }
+  }
+  
+  // set stepper rate
+  if(enableStepper){
+    //determine direction the user wants, the limits it can go, then set that speed
+    int stepperDirection = stepSpeed * (readPin(STEPPER_ON) ? 1 : readPin(STEPPER_OFF) ? -1 : 0);
+    //preform limit checks
+    stepperDirection = (readPin(UPPER_LIMIT) ? minim(stepperDirection, 0) : (readPin(LOWER_LIMIT) ? max(stepperDirection ,0) : stepperDirection));
+    if(stepperDirection != 0){
+      writeStepperPos(now, previous, initial);
+    }
+    setStepSpeed(stepperDirection);
+  }
+  // set fan rate
+  setFanMotor(checkFan);
+
+  // set led
+  turnLEDOn(ledC);
+
+  // display temp hum, if we are allowed to, and if the time since the last one has been greater then one minute
+  if(TempHumidityDis && abs(printOldTemp - now.min()) >= 1){
+    
+    lcd.clear();
+    printOldTemp = now.min(); // update prev
+    temp = dht.readTemperature();
+    hum = dht.readHumidity();
+    lcd.print("Temp, Humidity");
+    delay(1000);
+    lcd.clear();
+    lcd.print(temp); // write temp to lcd
+    lcd.print(hum); // write hum to lcd
+  }
+
+  previous = initial;
+  // check water level, if allowed to
+  if(checkLevel){
+    int waterLevel = adc_read(WATER_LEVEL); // calc water lvl
+    if(waterLevel <= WATER_THRESH){
+      initial = ERROR;
+    }
+  }
+  
+  delay(500);
+}
+int readPin(int pin) {
+  // read the value of the pin using the PIN register
+  return PIN_A & (0x01 << pin);
+}
+int waterRead(int pin){
+  return PIN_H & (0x01 << pin);
+}
+
+bool isButtonOn = true;
+
+// if handle on off button is pressed this will automatically be called
+void changeHandleState(){
+  previous = initial;
+  bool buttonPressed = readPin(IO);
+  if(isButtonOn && buttonPressed){
+    initial = IDLE;
+    isButtonOn = false;
+  }else if(buttonPressed) {
+    initial = DISABLED;
+    isButtonOn = true;
+  }
+}
+
+//write simple msgs over serial one char at a time
+//serial is used to output the time mainly
+void writeStepperPos(DateTime now, States previous, States initial){
+  U0putchar('S');
+  U0putchar('T');
+  U0putchar('E');
+  U0putchar('P');
+
+  
+  U0putchar(' ');
+  writeTimeStampTransition(now, previous, initial);
+}
+
+//write simple msgs over serial one char at a time
+void writeTimeStampTransition(DateTime now, States previous, States initial){
+  unsigned char pState = (previous == DISABLED ? 'd' : (previous == IDLE ? 'i' : (previous == RUNNING ? 'r' : (previous == ERROR ? 'e' : 'u'))));
+  unsigned char cState = (initial == DISABLED ? 'd' : (initial == IDLE ? 'i' : (initial == RUNNING ? 'r' : (initial == ERROR ? 'e' : 'u')))); 
+  
+  U0putchar(pState);
+  U0putchar(':');
+  U0putchar(cState);
+
+  U0putchar(' ');
+
+//initialized a lot of variables for outputting the date and time
+  int year = now.year();
+  int mon = now.mon();
+  int day = now.day();
+  int hr = now.hr();
+  int min = now.min();
+  int sec = now.sec();
+  char numbers[10] = {'0','1','2','3','4','5','6','7','8','9'};
+  int singleDigiYr = yr % 10; //indications for single digit years
+  int doubleDigiYr = yr / 10 % 10; //indications for double digit years
+  int singleDigiMon = mon % 10; //indications for single digit months
+  int doubleDigiMon = mon / 10 % 10; //indications for double digit months
+  int singleDigiDay = day % 10; //indications for single digit days
+  int doubleDigiDay = day / 10 % 10; //indications for double digit days
+  int singleDigiHr = hr % 10; //indications for single digit hours
+  int doubleDigiHr = hr / 10 % 10; //indications for double digit hours
+  int singleDigiMin = min % 10; //indications for single digit minutes
+  int doubleDigiMin = min / 10 % 10; //indications for double digit minutes
+  int singleDigiSec = sec % 10; //indications for single digit seconds
+  int doubleDigiSec = sec / 10 % 10; //indications for double digit seconds
+  
+  //a lottttt of char data is output for formatting on the output
+  U0putchar('Mon');
+  U0putchar(':');
+  U0putchar('Day');// this sections is for the date
+  U0putchar(':');
+  U0putchar('Yr');
+
+  U0putchar(' ');
+  
+  U0putchar('Hr');
+  U0putchar(':');
+  U0putchar('Min'); //this section is for the time
+  U0putchar(':');
+  U0putchar('Sec');
+
+  U0putchar(' ');
+
+  U0putchar(numbers[doubleDigiMon]); //outputting the month
+  U0putchar(numbers[singleDigiMon]);
+  U0putchar(':');
+  U0putchar(numbers[doubleDigiDay]);//outputting the day
+  U0putchar(numbers[singleDigiDay]);
+  U0putchar(':');
+  U0putchar(numbers[doubleDigiYr]); //outputting the year
+  U0putchar(numbers[singleDigiYr]);
+  
+  U0putchar(' ');
+
+  U0putchar(numbers[doubleDigiHr]); //outputting the hour
+  U0putchar(numbers[singleDigiHr]);
+  U0putchar(':');
+  U0putchar(numbers[doubleDigiMin]); //outputting the minute
+  U0putchar(numbers[singleDigiMin]);
+  U0putchar(':');
+  U0putchar(numbers[doubleDigiSec]); //outputting the second
+  U0putchar(numbers[singleDigiSec]);
+
+  U0putchar('\n');
+}
+
+States decide(float temp, int waterLevel, States initial){ // this function is comprised of an if else if statement to determine if the LDC will display 
+//idle or running states
+
+  States state;
+  if(temp <= TEMP_THRESH && initial == RUNNING){
+    state = IDLE;
+  }else if(temp > TEMP_THRESH && initial == IDLE){
+    state = RUNNING;
+  }else if(initial == ERROR && readPin(RESET) && waterLevel > WATER_THRESH){
+    state = IDLE;
+  }else{
+    state = initial;
+  }
+
+  return state;
+}
+
+// method to turn one led of our choosing and disable the others using an AND operation
+void turnLEDOn(int ledPin) {
+  PORT_H &= ~(0x01 << RED_PIN);
+  PORT_G &= ~(0x01 << BLUE_PIN);
+  PORT_E &= ~(0x01 << GREEN_PIN);
+  PORT_E &= ~(0x01 << YELLOW_PIN);
+
+  // turn on the specified LED using an OR operation
+  switch (ledPin) {
+    case 0:
+      PORT_H |= 0x01 << RED_PIN;
+      break;
+    case 1:
+      PORT_G |= 0x01 << BLUE_PIN;
+      break;
+    case 2:
+      PORT_E |= 0x01 << GREEN_PIN;
+      break;
+    case 3:
+      PORT_E |= 0x01 << YELLOW_PIN;
+      break;
+  }
+}
+
+
+// sets the stepper speed
+void setStepSpeed(int dist){
+  stepper.step(dist);
+}
+
+// turn fan motor on or off
+void setFanMotor(bool on){
+  if(on){
+    PORT_H |= (0x01 << FAN_MOTOR);
+  }else {
+    PORT_H &= ~(0x01 << FAN_MOTOR);
+  }
+}
+
+// THIS IS CODE USED IN OTHER PROJECTS PRIOR
+//---------------start analog read-----------------
+void adc_init(){ 
+     ADCSRA = 0x80;
+     ADCSRB = 0x00;
+     ADMUX = 0x40;
+}
+
+unsigned int adc_read(unsigned char adc_channel){
+     ADCSRB &= 0xF7; // Reset MUX5.
+     ADCSRB |= (adc_channel & 0x08); // Set MUX5.
+     ADMUX &= 0xF8; // Reset MUX2:0.
+     ADMUX |= (adc_channel & 0x07); // Set MUX2:0.
+
+     ADCSRA |= 0x40; // Start the conversion.
+     while (ADCSRA & 0x40) {} // Converting...
+     return ADC; // Return the converted number.
+}
+
+//---------------end analog read-----------------
+
+//---------------start serial print-----------------
+// function to initialize USART0 to "int" Baud, 8 data bits,
+// no parity, and one stop bit. Assume FCPU = 16MHz.
+//BELLOW IS CODE PROVIDED FOR OTHER LABS THAT WERE CONDUCTED IN THIS CLASS
+void U0init(unsigned long U0baud) //code provided in class
+{
+//  Students are responsible for understanding
+//  this initialization code for the ATmega2560 USART0
+//  and will be expected to be able to intialize
+//  the USART in differrent modes.
+//
+ unsigned long FCPU = 16000000;
+ unsigned int tbaud;
+ tbaud = (FCPU / 16 / U0baud - 1);
+ // Same as (FCPU / (16 * U0baud)) - 1;
+ *myUCSR0A = 0x20;
+ *myUCSR0B = 0x18;
+ *myUCSR0C = 0x06;
+ *myUBRR0  = tbaud;
+}
+//
+// Read USART0 RDA status bit and return non-zero true if set
+//
+unsigned char U0kbhit()
+{
+  return (RDA & *myUCSR0A);
+}
+//
+// Read input character from USART0 input buffer
+//
+unsigned char U0getchar()
+{
+  return *myUDR0;
+}
+//
+// Wait for USART0 TBE to be set then write character to
+// transmit buffer
+//
+void U0putchar(unsigned char U0pdata)
+{
+  while(!(TBE & *myUCSR0A));
+  *myUDR0 = U0pdata;
+}
+//---------------end serial print-----------------
